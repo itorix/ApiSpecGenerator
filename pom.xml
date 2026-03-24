@@ -4,7 +4,7 @@
 
     <groupId>com.itorix.apiwiz</groupId>
     <artifactId>SpecGeneratorExternal</artifactId>
-    <version>0.0.1-RELEASE</version>
+    <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <name>ApiSpecGen</name>
@@ -197,17 +197,17 @@
             </plugin>
 
 
-            <plugin>
-                <groupId>org.sonatype.central</groupId>
-                <artifactId>central-publishing-maven-plugin</artifactId>
-                <version>0.9.0</version>
-                <extensions>true</extensions>
-                <configuration>
-                    <publishingServerId>central</publishingServerId>
-                    <autoPublish>true</autoPublish>
-                    <waitUntil>published</waitUntil>
-                </configuration>
-            </plugin>
+<!--            <plugin>-->
+<!--                <groupId>org.sonatype.central</groupId>-->
+<!--                <artifactId>central-publishing-maven-plugin</artifactId>-->
+<!--                <version>0.9.0</version>-->
+<!--                <extensions>true</extensions>-->
+<!--                <configuration>-->
+<!--                    <publishingServerId>central</publishingServerId>-->
+<!--                    <autoPublish>true</autoPublish>-->
+<!--                    <waitUntil>published</waitUntil>-->
+<!--                </configuration>-->
+<!--            </plugin>-->
 
         </plugins>
     </build>

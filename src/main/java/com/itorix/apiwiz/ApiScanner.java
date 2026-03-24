@@ -1,9 +1,9 @@
 package com.itorix.apiwiz;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.itorix.apiwiz.enhance.apiwiz.Enhancer;
 import com.itorix.apiwiz.model.ApiEndpoint;
 import io.swagger.util.Json;
+import io.swagger.v3.oas.models.Components;
 import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.PathItem;
@@ -31,16 +31,19 @@ import java.net.URLClassLoader;
 import java.text.CharacterIterator;
 import java.text.StringCharacterIterator;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.UUID;
 import org.apache.commons.lang3.StringUtils;
 import org.reflections.Reflections;
@@ -64,11 +67,17 @@ import org.springframework.web.bind.annotation.RestController;
 
 public class ApiScanner {
 
-    public static void main(String[] args) throws MalformedURLException, JsonProcessingException {
+    private static Map<String, Schema<?>> componentSchemas = new HashMap<>();
+    private static Map<String, Integer> schemaNameCounter = new HashMap<>();
+    private static Map<Class<?>, String> classToSchemaName = new HashMap<>();
+    private static Map<String, Integer> nameCount = new HashMap<>();
+    public static void main(String[] args) throws MalformedURLException {
 
         String projectBasedir = args[0];
         String fileLocation = args[1];
         File projectRoot = new File(projectBasedir);
+
+        String moduleName = projectRoot.getName();
 
         List<URL> urls = new ArrayList<>();
 
@@ -84,27 +93,25 @@ public class ApiScanner {
                 .setScanners(Scanners.TypesAnnotated));
         controllers.addAll(reflections.getTypesAnnotatedWith(RestController.class));
         controllers.addAll(reflections.getTypesAnnotatedWith(Controller.class));
+        controllers.addAll(reflections.getTypesAnnotatedWith(RequestMapping.class));
 
         List<ApiEndpoint> apiEndpoints = new ArrayList<>();
-
         OpenAPI openAPI = new OpenAPI();
         if(openAPI.getInfo() == null){
-            openAPI.setInfo(new Info().version("v0").title("OpenAPI Definition"));
+            openAPI.setInfo(new Info().title(formatModuleName(moduleName)).version("v0"));
         }
         if(openAPI.getPaths() == null ){
             openAPI.setPaths(new Paths());
         }
-        openAPI.getInfo().setTitle("");
-        openAPI.getInfo().setVersion("1.0.0");
-        openAPI.getInfo().setDescription("");
         Server server = new Server();
         server.setUrl("http://localhost:8000");
         if(openAPI.getServers() == null){
             openAPI.setServers(new ArrayList<>());
         }
+        Components components = new Components();
         openAPI.getServers().add(server);
         Map<String, Integer> operationNameCount = new HashMap<>();
-        Map<String, String> regexMap = new LinkedHashMap();
+        Map<String, String> regexMap = new LinkedHashMap<>();
         for (Class<?> controller : controllers) {
             try {
                 boolean isInterface = controller.isInterface();
@@ -113,7 +120,6 @@ public class ApiScanner {
                 for (Method method : accessibleMethods) {
                     try {
                         String url = getMappingUrl(controller, method);
-
                         if(url != null && !url.startsWith("/")){
                             url = url.replaceFirst("://([^:]+)(?:.+)@", "://$1@");
                             url = "/" + url;
@@ -123,18 +129,18 @@ public class ApiScanner {
                             String methodType = getMethod(method);
                             if (!checkApiExists(isInterface, apiEndpoints, url, methodType, method.getName())) {
                                 PathItem pathItem = new PathItem();
-                                if(openAPI.getPaths().get(url) != null){
+                                if(openAPI.getPaths().get(url) != null) {
                                     pathItem = openAPI.getPaths().get(url);
                                 }
                                 Operation operation = new Operation();
-                                if(operation.getParameters() == null){
+                                if(operation.getParameters() == null) {
                                     operation.setParameters(new ArrayList<>());
                                 }
                                 String baseName = method.getName();
                                 int count = operationNameCount.getOrDefault(baseName, 0);
-                                String operationId = (count ==0) ? baseName : baseName + "_" + count;
+                                String operationId = (count == 0) ? baseName : baseName + "_" + count;
                                 operation.setOperationId(operationId);
-                                operationNameCount.put(baseName, count+1);
+                                operationNameCount.put(baseName, count + 1);
                                 boolean bodyExists = checkBodyExists(method.getParameters());
                                 List<Parameter> bodyParams = new ArrayList<>();
                                 for (Parameter parameter : method.getParameters()) {
@@ -142,7 +148,7 @@ public class ApiScanner {
                                         String paramType = getParameterType(parameter,bodyExists);
                                         if (paramType.equals("Body")) {
                                             try {
-                                                operation.setRequestBody(getRequestBody(parameter.getParameterizedType()));
+                                                operation.setRequestBody(getRequestBody(parameter.getParameterizedType(), components));
                                             } catch (Exception e) {
                                             }
                                         }else if(!bodyExists && (paramType.equals("ModelAttribute") || paramType.equals("RequestPart"))){
@@ -160,9 +166,10 @@ public class ApiScanner {
                                                     jsonObject.setType("object");
                                                     schema = jsonObject;
                                                 }else {
-                                                    Class<?> bodyClass = extractClassFromType(type, jsonObject);
+                                                    // Parameters should be INLINE (not component refs)
+                                                    Class<?> bodyClass = extractClassFromTypeInline(type, jsonObject);
                                                     if (bodyClass != null) {
-                                                        processFieldsSchema(bodyClass, jsonObject, new HashSet<>());
+                                                        processFieldsSchemaInline(bodyClass, jsonObject, new HashSet<>());
                                                     }
                                                     schema = jsonObject;
                                                 }
@@ -175,21 +182,15 @@ public class ApiScanner {
                                     }
                                 }
                                 if(!bodyParams.isEmpty()) {
-                                    operation.setRequestBody(getRequestBodyFieldsSchema(bodyParams));
+                                    operation.setRequestBody(getRequestBodyFieldsSchema(bodyParams, components));
                                 }
                                 try {
-                                    operation.setResponses(extractResponseBodies(method));
+                                    operation.setResponses(extractResponseBodies(method,components));
                                 } catch (NoClassDefFoundError | Exception e) {
                                 }
                                 if(operation.getTags() == null){
                                     operation.setTags(new ArrayList<>());
                                     operation.getTags().add(name);
-                                }
-                                //TODO
-                                if(true){
-
-//                    System.out.println("Enhance Completed");
-//                    System.out.println("Enhanced Operation  : \n" + Json.pretty(operation));
                                 }
                                 switch (methodType){
                                     case "GET":
@@ -219,7 +220,14 @@ public class ApiScanner {
             }
         }
 
-        String openAPIFile = fileLocation + UUID.randomUUID().toString().replaceAll("[^A-Za-z]", "").substring(0, 5) + "-openapi.json";
+        openAPI.setComponents(components);
+        String name;
+        if(openAPI.getInfo().getTitle().equalsIgnoreCase("OpenAPI Definition")){
+            name = UUID.randomUUID().toString().replaceAll("[^A-Za-z]", "").substring(0, 5) + "-openapi";
+        }else{
+            name = openAPI.getInfo().getTitle();
+        }
+        String openAPIFile = fileLocation +  name + ".json";
         if(openAPI.getPaths() != null && !openAPI.getPaths().isEmpty()) {
             String pretty = Json.pretty(openAPI);
             pretty = pretty.replaceAll("\"exampleSetFlag\"\\s*:\\s*true\\s*,?", "");
@@ -240,28 +248,53 @@ public class ApiScanner {
         }
     }
 
-    private static io.swagger.v3.oas.models.parameters.RequestBody getRequestBody(Type type) {
-        io.swagger.v3.oas.models.parameters.RequestBody requestBody = new io.swagger.v3.oas.models.parameters.RequestBody();
-        io.swagger.v3.oas.models.media.Content content = new io.swagger.v3.oas.models.media.Content();
-        MediaType mediaType = new MediaType();
-        content.put("application/json",mediaType);
-        Schema<?> jsonObject = new Schema();
-        try {
-            Class<?> bodyClass = extractClassFromType(type, jsonObject);
-            if (bodyClass != null) {
-                processFieldsSchema(bodyClass, jsonObject, new HashSet<>());
-            }
+    private static String formatModuleName(String moduleName) {
+        if (moduleName == null || moduleName.isEmpty()) {
+            return "OpenAPI Definition";
+        }
+        String[] parts = moduleName.split("[-_]");
+        StringBuilder formatted = new StringBuilder();
 
-            mediaType.setSchema(jsonObject);
+        for (String part : parts) {
+            if (!part.isEmpty()) {
+                formatted.append(Character.toUpperCase(part.charAt(0)))
+                        .append(part.substring(1).toLowerCase())
+                        .append(" ");
+            }
+        }
+
+        String name = formatted.toString().trim();
+        int count = nameCount.getOrDefault(name, 0);
+        return (count == 0) ? name : name + "_" + count;
+    }
+
+    // REQUEST BODY - Uses component references
+    private static io.swagger.v3.oas.models.parameters.RequestBody getRequestBody(Type type, Components components) {
+        io.swagger.v3.oas.models.parameters.RequestBody requestBody = new io.swagger.v3.oas.models.parameters.RequestBody();
+        io.swagger.v3.oas.models.media.Content content = new Content();
+        MediaType mediaType = new MediaType();
+        content.put("application/json", mediaType);
+
+        Schema<?> schema = new Schema<>();
+        try {
+            Class<?> bodyClass = extractClassFromType(type, schema, components);
+            if (bodyClass != null) {
+                // Create reference to component schema
+                String schemaName = getOrCreateComponentSchema(bodyClass, components);
+                schema.set$ref("#/components/schemas/" + schemaName);
+            }
+            mediaType.setSchema(schema);
         } catch (NoClassDefFoundError | Exception ex) {
             System.out.println("Warning: Could not process body fields for " + type.getTypeName() + ": " + ex.getMessage());
         }
+
         requestBody.setContent(content);
         return requestBody;
     }
 
 
-    private static io.swagger.v3.oas.models.parameters.RequestBody getRequestBodyFieldsSchema(List<Parameter> bodyParams) {
+    private static io.swagger.v3.oas.models.parameters.RequestBody getRequestBodyFieldsSchema(List<Parameter> bodyParams,
+            Components components) {
         io.swagger.v3.oas.models.parameters.RequestBody requestBody = new io.swagger.v3.oas.models.parameters.RequestBody();
         Schema<?> jsonObject = new Schema<>();
         jsonObject.setType( "object");
@@ -276,9 +309,9 @@ public class ApiScanner {
             for (Parameter param : bodyParams) {
                 String paramName = getParamName(param);
                 if (param.isAnnotationPresent(ModelAttribute.class)) {
-                    properties.put(paramName,getBodyFieldsSchema(param.getParameterizedType()));
+                    properties.put(paramName,getBodyFieldsSchema(param.getParameterizedType(),components));
                 } else if (param.isAnnotationPresent(RequestPart.class)) {
-                    properties.put(paramName,getBodyFieldsSchema(param.getParameterizedType()));
+                    properties.put(paramName,getBodyFieldsSchema(param.getParameterizedType(),components));
                 }
 
             }
@@ -330,8 +363,7 @@ public class ApiScanner {
         try {
             Method[] declaredMethods = controller.getDeclaredMethods();
             for (Method method : declaredMethods) {
-                if (java.lang.reflect.Modifier.isPublic(method.getModifiers()) &&
-                        (method.isAnnotationPresent(RequestMapping.class) ||
+                if ((method.isAnnotationPresent(RequestMapping.class) ||
                                 method.isAnnotationPresent(GetMapping.class) ||
                                 method.isAnnotationPresent(PostMapping.class) ||
                                 method.isAnnotationPresent(PutMapping.class) ||
@@ -419,12 +451,13 @@ public class ApiScanner {
     }
 
 
-    private static Schema<?> getBodyFieldsSchema(Type type) {
+    private static Schema<?> getBodyFieldsSchema(Type type, Components components) {
         Schema<?> jsonObject = new Schema<>();
         try {
-            Class<?> bodyClass = extractClassFromType(type, jsonObject);
+            Class<?> bodyClass = extractClassFromType(type, jsonObject,components);
             if (bodyClass != null) {
-                processFieldsSchema(bodyClass, jsonObject, new HashSet<>());
+                String schemaName = getOrCreateComponentSchema(bodyClass, components);
+                jsonObject.set$ref("#/components/schemas/" + schemaName);
             }
             return jsonObject;
         } catch (NoClassDefFoundError | Exception ex) {
@@ -432,12 +465,13 @@ public class ApiScanner {
         return jsonObject;
     }
 
-    private static Schema<?> getSchemaObject(Type type) {
+    private static Schema<?> getSchemaObject(Type type, Components components) {
         Schema<?> schema = new Schema<>();
         try {
-            Class<?> bodyClass = extractClassFromType(type, schema);
+            Class<?> bodyClass = extractClassFromType(type, schema,components);
             if (bodyClass != null) {
-                processFieldsSchema(bodyClass, schema, new HashSet<>());
+                String schemaName = getOrCreateComponentSchema(bodyClass, components);
+                schema.set$ref("#/components/schemas/" + schemaName);
                 return schema;
             }
 
@@ -447,13 +481,289 @@ public class ApiScanner {
         return schema;
     }
 
-    private static Class<?> extractClassFromType(Type type, Schema<?> schema ) {
-        if (type instanceof Class<?> ) {
+    private static Class<?> extractClassFromType(Type type, Schema<?> schema, Components components) {
+        if (type instanceof Class<?>) {
+            Class<?> clazz = (Class<?>) type;
+            if (clazz.isArray()) {
+                Class<?> componentType = clazz.getComponentType();
+                schema.setType("array");
+                if (shouldCreateComponentSchema(componentType)) {
+                    String schemaName = getOrCreateComponentSchema(componentType, components);
+                    Schema<?> items = new Schema<>();
+                    items.set$ref("#/components/schemas/" + schemaName);
+                    schema.setItems(items);
+                } else {
+                    Schema<?> items = new Schema<>();
+                    processFieldsSchema(componentType, items, new HashSet<>(), components);
+                    schema.setItems(items);
+                }
+                return null;
+            }
+            return clazz;
+        } else if (type instanceof ParameterizedType) {
+            ParameterizedType parameterizedType = (ParameterizedType) type;
+            Type rawType = parameterizedType.getRawType();
+
+            if (rawType == Optional.class) {
+                Type wrappedType = parameterizedType.getActualTypeArguments()[0];
+                return extractClassFromType(wrappedType, schema, components);
+            }
+            if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class || rawType == LinkedList.class || rawType == ArrayList.class || rawType == TreeSet.class || rawType == LinkedHashSet.class) {
+                Type elementType = parameterizedType.getActualTypeArguments()[0];
+                schema.setType("array");
+                Schema<?> itemsSchema = createSchemaForType(elementType, components);
+                schema.setItems(itemsSchema);
+                return null;
+            } else if (rawType == Map.class || rawType == TreeMap.class || rawType == HashMap.class || rawType == LinkedHashMap.class) {
+                Type[] typeArguments = parameterizedType.getActualTypeArguments();
+                Type valueType = typeArguments.length > 1 ? typeArguments[1] : null;
+                schema.setType("object");
+                Schema<?> additionalProps = createSchemaForType(valueType, components);
+                schema.setAdditionalProperties(additionalProps);
+                return null;
+            }
+
+            return (Class<?>) rawType;
+        }
+        return null;
+    }
+
+    private static Schema<?> createSchemaForType(Type type, Components components) {
+        Schema<?> schema = new Schema<>();
+        if (type instanceof Class<?>) {
+            Class<?> clazz = (Class<?>) type;
+            if (shouldCreateComponentSchema(clazz)) {
+                String schemaName = getOrCreateComponentSchema(clazz, components);
+                schema.set$ref("#/components/schemas/" + schemaName);
+            } else {
+                processFieldsSchema(clazz, schema, new HashSet<>(), components);
+            }
+        } else if (type instanceof ParameterizedType) {
+            processGenericTypeSchema(type, schema, new HashSet<>(), components);
+        }
+        return schema;
+    }
+
+    private static boolean shouldCreateComponentSchema(Class<?> clazz) {
+        if (clazz == null) return false;
+        if (clazz.isArray()) return false;
+        if (clazz.isPrimitive()) return false;
+        if (clazz.isEnum()) return true;
+
+        String className = clazz.getName();
+        if (className.startsWith("java.lang.") && !className.equals("java.lang.Object")) return false;
+        if (className.startsWith("java.util.") && !isCollectionOrMap(clazz)) return false;
+
+        return !className.startsWith("java.") && !className.startsWith("javax.");
+    }
+
+    private static boolean isCollectionOrMap(Class<?> clazz) {
+        return Collection.class.isAssignableFrom(clazz) || Map.class.isAssignableFrom(clazz);
+    }
+
+    private static String getOrCreateComponentSchema(Class<?> clazz, Components components) {
+        if (clazz == null) return "UnknownType";
+
+        if (classToSchemaName.containsKey(clazz)) {
+            return classToSchemaName.get(clazz);
+        }
+
+        String schemaName = generateSchemaName(clazz);
+
+        // Prevent infinite recursion: put placeholder immediately
+        classToSchemaName.put(clazz, schemaName);
+
+        if (components.getSchemas() == null) {
+            components.setSchemas(new HashMap<>());
+        }
+
+        // Also put an empty schema first (to break circular reference)
+        Schema<?> placeholder = new Schema<>();
+        placeholder.setType("object");
+        components.getSchemas().put(schemaName, placeholder);
+
+        // Now populate fields safely
+        try {
+            Schema<?> schema = new Schema<>();
+            Set<Class<?>> visited = new HashSet<>();
+            processFieldsSchema(clazz, schema, visited, components);
+
+            // Replace placeholder with actual schema
+            components.getSchemas().put(schemaName, schema);
+            componentSchemas.put(schemaName, schema);
+        } catch (Throwable t) {
+            System.err.println("Error processing schema for " + clazz.getName() + ": " + t.getMessage());
+        }
+
+        return schemaName;
+    }
+
+
+
+    private static String generateSchemaName(Class<?> clazz) {
+        String simpleName = clazz.getSimpleName();
+        String packageName = clazz.getPackage() != null ? clazz.getPackage().getName() : "";
+
+        if (schemaNameCounter.containsKey(simpleName)) {
+            boolean isSameClass = false;
+            for (Map.Entry<Class<?>, String> entry : classToSchemaName.entrySet()) {
+                if (entry.getValue().startsWith(simpleName) && entry.getKey().equals(clazz)) {
+                    isSameClass = true;
+                    break;
+                }
+            }
+
+            if (!isSameClass) {
+                int counter = schemaNameCounter.get(simpleName);
+                schemaNameCounter.put(simpleName, counter + 1);
+
+                return simpleName + "_" + counter;
+            }
+        } else {
+            schemaNameCounter.put(simpleName, 1);
+        }
+
+        return simpleName;
+    }
+
+    private static void processFieldsSchema(Class<?> bodyClass, Schema<?> schema, Set<Class<?>> visited, Components components) {
+        if (bodyClass == null || visited.contains(bodyClass)) {
+            return;
+        }
+        visited.add(bodyClass);
+
+        if (bodyClass.isArray()) {
+            Class<?> componentType = bodyClass.getComponentType();
+            schema.setType("array");
+            Schema<?> itemsSchema = new Schema<>();
+            if (shouldCreateComponentSchema(componentType)) {
+                String schemaName = getOrCreateComponentSchema(componentType, components);
+                itemsSchema.set$ref("#/components/schemas/" + schemaName);
+            } else {
+                processFieldsSchema(componentType, itemsSchema, visited, components);
+            }
+            schema.setItems(itemsSchema);
+            return;
+        }
+
+        if (bodyClass.isEnum()) {
+            schema.setType("string");
+            List<String> enumValues = new ArrayList<>();
+            for (Object enumConstant : bodyClass.getEnumConstants()) {
+                enumValues.add(enumConstant.toString());
+            }
+            if (!enumValues.isEmpty()) {
+                schema.setEnum(castList(enumValues));
+            }
+        } else if (isPrimitiveOrJavaType(bodyClass)) {
+            setPrimitiveTypeSchema(bodyClass, schema);
+        } else {
+            schema.setType("object");
+            Map<String, Schema> properties = new HashMap<>();
+            schema.setProperties(properties);
+
+            try {
+                List<Field> allFields = getAllFields(bodyClass);
+                for (Field field : allFields) {
+                    if (java.lang.reflect.Modifier.isStatic(field.getModifiers()) || field.isSynthetic()) {
+                        continue;
+                    }
+
+                    field.setAccessible(true);
+                    String fieldName = field.getName();
+                    Type fieldType = field.getGenericType();
+                    Schema<?> fieldSchema = new Schema<>();
+
+                    if (fieldType instanceof ParameterizedType) {
+                        processParameterizedTypeSchema((ParameterizedType) fieldType, fieldSchema, visited, components);
+                    } else if (field.getType().isArray()) {
+                        Class<?> componentType = field.getType().getComponentType();
+                        fieldSchema.setType("array");
+                        Schema<?> itemsSchema = new Schema<>();
+                        if (shouldCreateComponentSchema(componentType)) {
+                            String schemaName = getOrCreateComponentSchema(componentType, components);
+                            itemsSchema.set$ref("#/components/schemas/" + schemaName);
+                        } else {
+                            processFieldsSchema(componentType, itemsSchema, visited, components);
+                        }
+                        fieldSchema.setItems(itemsSchema);
+                    } else {
+                        if (shouldCreateComponentSchema(field.getType())) {
+                            String schemaName = getOrCreateComponentSchema(field.getType(), components);
+                            fieldSchema.set$ref("#/components/schemas/" + schemaName);
+                        } else {
+                            processFieldsSchema(field.getType(), fieldSchema, visited, components);
+                        }
+                    }
+                    properties.put(fieldName, fieldSchema);
+                }
+            } catch (NoClassDefFoundError | Exception ex) {
+                System.out.println("Warning: Error processing fields for " + bodyClass.getName() + ": " + ex.getMessage());
+            }
+        }
+
+        visited.remove(bodyClass);
+    }
+
+
+    @SuppressWarnings("unchecked")
+    private static <T> List<T> castList(List<?> list) {
+        return (List<T>) list;
+    }
+
+    private static void processParameterizedTypeSchema(ParameterizedType paramType, Schema<?> schema, Set<Class<?>> visited, Components components) {
+        Type rawType = paramType.getRawType();
+
+        if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class || rawType == LinkedList.class || rawType == ArrayList.class || rawType == TreeSet.class || rawType == LinkedHashSet.class) {
+            schema.setType("array");
+            Type elementType = paramType.getActualTypeArguments()[0];
+            Schema<?> itemsSchema = createSchemaForType(elementType, components);
+            schema.setItems(itemsSchema);
+        } else if (rawType == Map.class || rawType == TreeMap.class || rawType == HashMap.class || rawType == LinkedHashMap.class) {
+            schema.setType("object");
+            Type[] typeArguments = paramType.getActualTypeArguments();
+            Type valueType = typeArguments.length > 1 ? typeArguments[1] : null;
+            Schema<?> additionalProps = createSchemaForType(valueType, components);
+            schema.setAdditionalProperties(additionalProps);
+        } else if (rawType instanceof Class<?>) {
+            Class<?> rawClass = (Class<?>) rawType;
+            if (shouldCreateComponentSchema(rawClass)) {
+                String schemaName = getOrCreateComponentSchema(rawClass, components);
+                schema.set$ref("#/components/schemas/" + schemaName);
+            } else {
+                processFieldsSchema(rawClass, schema, visited, components);
+            }
+        }
+    }
+
+
+    private static void processGenericTypeSchema(Type type, Schema<?> schema, Set<Class<?>> visited, Components components) {
+        if (type instanceof Class<?>) {
+            Class<?> clazz = (Class<?>) type;
+            if (shouldCreateComponentSchema(clazz)) {
+                String schemaName = getOrCreateComponentSchema(clazz, components);
+                schema.set$ref("#/components/schemas/" + schemaName);
+            } else {
+                processFieldsSchema(clazz, schema, visited, components);
+            }
+        } else if (type instanceof ParameterizedType) {
+            processParameterizedTypeSchema((ParameterizedType) type, schema, visited, components);
+        } else {
+            schema.setType("object");
+        }
+    }
+
+    // ===========================================
+    // INLINE SCHEMA METHODS (for Parameters)
+    // ===========================================
+
+    private static Class<?> extractClassFromTypeInline(Type type, Schema<?> schema) {
+        if (type instanceof Class<?>) {
             Class<?> clazz = (Class<?>) type;
             if (clazz.isArray()) {
                 Class<?> componentType = clazz.getComponentType();
                 Schema<?> items = new Schema<>();
-                processFieldsSchema(componentType, items, new HashSet<>());
+                processFieldsSchemaInline(componentType, items, new HashSet<>());
                 schema.setType("array");
                 schema.setItems(items);
                 return null;
@@ -463,18 +773,22 @@ public class ApiScanner {
             ParameterizedType parameterizedType = (ParameterizedType) type;
             Type rawType = parameterizedType.getRawType();
 
-            if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class) {
+            if (rawType == Optional.class) {
+                Type wrappedType = parameterizedType.getActualTypeArguments()[0];
+                return extractClassFromTypeInline(wrappedType, schema);
+            }
+            if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class || rawType == LinkedList.class || rawType == ArrayList.class || rawType == TreeSet.class || rawType == LinkedHashSet.class) {
                 Type elementType = parameterizedType.getActualTypeArguments()[0];
                 Schema<?> itemsJson = new Schema<>();
-                processGenericTypeSchema(elementType, itemsJson, new HashSet<>());
+                processGenericTypeSchemaInline(elementType, itemsJson, new HashSet<>());
                 schema.setType("array");
                 schema.setItems(itemsJson);
                 return null;
-            } else if (rawType == Map.class) {
+            } else if (rawType == Map.class || rawType == TreeMap.class || rawType == HashMap.class || rawType == LinkedHashMap.class) {
                 Type[] typeArguments = parameterizedType.getActualTypeArguments();
                 Type valueType = typeArguments.length > 1 ? typeArguments[1] : null;
                 Schema<?> nestedJson = new Schema<>();
-                processGenericTypeSchema(valueType, nestedJson, new HashSet<>());
+                processGenericTypeSchemaInline(valueType, nestedJson, new HashSet<>());
                 schema.setType("object");
                 schema.setAdditionalProperties(nestedJson);
                 return null;
@@ -485,7 +799,7 @@ public class ApiScanner {
         return null;
     }
 
-    private static void processFieldsSchema(Class<?> bodyClass, Schema<?> items, Set<Class<?>> visited) {
+    private static void processFieldsSchemaInline(Class<?> bodyClass, Schema<?> items, Set<Class<?>> visited) {
         if (bodyClass == null || visited.contains(bodyClass)) {
             return;
         }
@@ -493,7 +807,7 @@ public class ApiScanner {
         if (bodyClass.isArray()) {
             Class<?> componentType = bodyClass.getComponentType();
             Schema<?> itemsJson = new Schema<>();
-            processFieldsSchema(componentType, itemsJson, visited);
+            processFieldsSchemaInline(componentType, itemsJson, visited);
             items.setType("array");
             items.setItems(itemsJson);
             return;
@@ -516,80 +830,31 @@ public class ApiScanner {
         }
         else if (bodyClass.isPrimitive() || bodyClass.getName().startsWith("java.") ||
                 bodyClass.getName().startsWith("javax.")) {
-            String parameterType = bodyClass.getSimpleName().toLowerCase();
-            if(parameterType.equals("int")){
-                items.setType("integer");
-            } else if (parameterType.equals("long")) {
-                items.setType("number");
-                items.setFormat("long");
-            } else if (parameterType.equals("bigdecimal")) {
-                items.setType("number");
-                items.setFormat("double");
-            }else if (parameterType.equals("short")) {
-                items.setType("integer");
-                items.setFormat("int32");
-            } else if (parameterType.equals("localdate")) {
-                items.setType("string");
-                items.setFormat("date");
-            } else if (parameterType.equalsIgnoreCase("datetimeformatter")) {
-                items.setType("string");
-                items.setFormat("date-time");
-            } else if (parameterType.equalsIgnoreCase("list")) {
-                items.setType("array");
-                items.setItems(new Schema<>());
-            }else if (parameterType.equalsIgnoreCase("zoneid")) {
-                items.setFormat("timezone");
-                items.setType("string");
-            } else if (parameterType.equalsIgnoreCase("pattern")) {
-                items.setType("string");
-                items.setFormat("regex");
-            } else if (parameterType.equals("float")) {
-                items.setType("number");
-                items.setFormat("float");
-            }else if (parameterType.equals("double")) {
-                items.setType("number");
-                items.setFormat("double");
-            }else if (parameterType.equals("date")) {
-                items.setType("string");
-                items.setFormat("date");
-            } else if (parameterType.equals("byte")) {
-                items.setType("string");
-                items.setFormat("byte");
-            }
-            else if (parameterType.equalsIgnoreCase("httpheaders") || parameterType.equalsIgnoreCase("path")
-                    || parameterType.equalsIgnoreCase("hashmap") || parameterType.equalsIgnoreCase("map")
-                    || parameterType.equalsIgnoreCase("optional")) {
-                items.setType("object");
-            }
-            else if (parameterType.equals("multipartfile") || parameterType.equals("file")) {
-                items.setType("string");
-                items.setFormat("binary");
-            } else if(parameterType.equalsIgnoreCase("void")){
-            } else{
-                items.setType(parameterType);
-            }
+            setPrimitiveTypeSchema(bodyClass, items);
         } else {
             items.setType("object");
             Map<String, Schema> properties = new HashMap<>();
             items.setProperties(properties);
             try {
-                for (Field field : bodyClass.getDeclaredFields()) {
+                List<Field> allFields = getAllFields(bodyClass);
+                for (Field field : allFields) {
+                    if (java.lang.reflect.Modifier.isStatic(field.getModifiers()) || field.isSynthetic()) {
+                        continue;
+                    }
                     field.setAccessible(true);
                     String fieldName = field.getName();
                     Type fieldType = field.getGenericType();
                     Schema<?> fieldSchema = new Schema<>();
                     if (fieldType instanceof ParameterizedType) {
-                        processParameterizedTypeSchema((ParameterizedType) fieldType, fieldSchema, fieldName, visited);
-                    }
-//          }
-                    else if (field.getType().isArray()) {
+                        processParameterizedTypeSchemaInline((ParameterizedType) fieldType, fieldSchema, visited);
+                    } else if (field.getType().isArray()) {
                         Class<?> componentType = field.getType().getComponentType();
                         Schema<?> itemsJson = new Schema<>();
-                        processFieldsSchema(componentType, itemsJson, visited);
+                        processFieldsSchemaInline(componentType, itemsJson, visited);
                         fieldSchema.setType("array");
                         fieldSchema.setItems(itemsJson);
                     } else {
-                        processFieldsSchema(field.getType(), fieldSchema, visited);
+                        processFieldsSchemaInline(field.getType(), fieldSchema, visited);
                     }
                     properties.put(fieldName, fieldSchema);
                 }
@@ -599,115 +864,130 @@ public class ApiScanner {
         visited.remove(bodyClass);
     }
 
-
-    @SuppressWarnings("unchecked")
-    private static <T> List<T> castList(List<?> list) {
-        return (List<T>) list;
-    }
-
-    private static void processParameterizedTypeSchema(ParameterizedType type, Schema<?> jsonObject, String fieldName, Set<Class<?>> visited) {
-        Type rawType = type.getRawType();
-        if (rawType == List.class || rawType == Set.class || rawType == Collection.class || rawType == HashSet.class || rawType == Arrays.class) {
-            Schema<?> itemsJson = new Schema<>();
-            Type elementType = type.getActualTypeArguments()[0];
-            processGenericTypeSchema(elementType, itemsJson, visited);
-            jsonObject.setName(fieldName);
-            jsonObject.setType("array");
-            jsonObject.setItems(itemsJson);
-        } else if (rawType == Map.class) {
-            Schema<?> additionalPropsJson = new Schema<>();
-            Type[] typeArguments = type.getActualTypeArguments();
-            Type valueType = typeArguments.length > 1 ? typeArguments[1] : null;
-            processGenericTypeSchema(valueType, additionalPropsJson, visited);
-            jsonObject.setName(fieldName);
-            jsonObject.setType("object");
-            jsonObject.setAdditionalProperties(additionalPropsJson);
-        }
-    }
-
-
-    private static void processGenericTypeSchema(Type type, Schema<?> jsonObject, Set<Class<?>> visited) {
+    private static void processGenericTypeSchemaInline(Type type, Schema<?> jsonObject, Set<Class<?>> visited) {
         if (type instanceof Class<?>) {
-            processFieldsSchema((Class<?>) type, jsonObject, visited);
+            processFieldsSchemaInline((Class<?>) type, jsonObject, visited);
         } else if (type instanceof ParameterizedType) {
             ParameterizedType paramType = (ParameterizedType) type;
             Type rawType = paramType.getRawType();
-            if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class) {
+            if (rawType == Optional.class) {
+                Type wrappedType = paramType.getActualTypeArguments()[0];
+                processGenericTypeSchemaInline(wrappedType, jsonObject, visited);
+                return;
+            }
+            if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class || rawType == LinkedList.class || rawType == ArrayList.class || rawType == TreeSet.class || rawType == LinkedHashSet.class) {
                 Schema<?> itemsJson = new Schema<>();
-                processGenericTypeSchema(paramType.getActualTypeArguments()[0], itemsJson, visited);
+                processGenericTypeSchemaInline(paramType.getActualTypeArguments()[0], itemsJson, visited);
                 jsonObject.setType("array");
                 jsonObject.setItems(itemsJson);
-            } else if (rawType == Map.class) {
+            } else if (rawType == Map.class || rawType == TreeMap.class || rawType == HashMap.class || rawType == LinkedHashMap.class) {
                 Schema<?> additionalPropsJson = new Schema<>();
                 Type[] typeArguments = paramType.getActualTypeArguments();
-                processGenericTypeSchema(typeArguments[1], additionalPropsJson, visited);
+                processGenericTypeSchemaInline(typeArguments[1], additionalPropsJson, visited);
                 jsonObject.setType("object");
                 jsonObject.setAdditionalProperties(additionalPropsJson);
             } else {
-                String parameterType = rawType.getTypeName().toLowerCase();
-                if(parameterType.equals("int")){
-                    jsonObject.setType("integer");
-                } else if (parameterType.equals("long")) {
-                    jsonObject.setType("number");
-                    jsonObject.setFormat("long");
-                } else if (parameterType.equals("bigdecimal")) {
-                    jsonObject.setType("number");
-                    jsonObject.setFormat("double");
-                }else if (parameterType.equals("short")) {
-                    jsonObject.setType("integer");
-                    jsonObject.setFormat("int32");
-                } else if (parameterType.equals("localdate")) {
-                    jsonObject.setType("string");
-                    jsonObject.setFormat("date");
-                } else if (parameterType.equalsIgnoreCase("datetimeformatter")) {
-                    jsonObject.setType("string");
-                    jsonObject.setFormat("date-time");
-                } else if (parameterType.equalsIgnoreCase("list")) {
-                    jsonObject.setType("array");
-                    jsonObject.setItems(new Schema<>());
-                }else if (parameterType.equalsIgnoreCase("zoneid")) {
-                    jsonObject.setFormat("timezone");
-                    jsonObject.setType("string");
-                } else if (parameterType.equalsIgnoreCase("pattern")) {
-                    jsonObject.setType("string");
-                    jsonObject.setFormat("regex");
-                } else if (parameterType.equals("float")) {
-                    jsonObject.setType("number");
-                    jsonObject.setFormat("float");
-                }else if (parameterType.equals("double")) {
-                    jsonObject.setType("number");
-                    jsonObject.setFormat("double");
-                }else if (parameterType.equals("date")) {
-                    jsonObject.setType("string");
-                    jsonObject.setFormat("date");
-                } else if (parameterType.equals("byte")) {
-                    jsonObject.setType("string");
-                    jsonObject.setFormat("byte");
-                }
-                else if (parameterType.equalsIgnoreCase("httpheaders") || parameterType.equalsIgnoreCase("path")
-                        || parameterType.equalsIgnoreCase("hashmap") || parameterType.equalsIgnoreCase("map")
-                        || parameterType.equalsIgnoreCase("optional")) {
-                    jsonObject.setType("object");
-                }
-                else if (parameterType.equals("multipartfile") || parameterType.equals("file")) {
-                    jsonObject.setType("string");
-                    jsonObject.setFormat("binary");
-                } else if(parameterType.equalsIgnoreCase("void")){
-                } else {
-                    try {
-                        Class<?> clazz = Class.forName(rawType.getTypeName());
-                        jsonObject.setType("object");
-                        processFieldsSchema(clazz, jsonObject, visited);
-                    } catch (ClassNotFoundException e) {
-                        jsonObject.setType(parameterType);
-                    }
-                }
+                processFieldsSchemaInline((Class<?>) rawType, jsonObject, visited);
             }
         } else {
             jsonObject.setType("object");
         }
     }
 
+    private static void processParameterizedTypeSchemaInline(ParameterizedType paramType, Schema<?> schema, Set<Class<?>> visited) {
+        Type rawType = paramType.getRawType();
+
+        if (rawType == List.class || rawType == Collection.class || rawType == Set.class || rawType == HashSet.class || rawType == LinkedList.class || rawType == ArrayList.class || rawType == TreeSet.class || rawType == LinkedHashSet.class) {
+            schema.setType("array");
+            Type elementType = paramType.getActualTypeArguments()[0];
+            Schema<?> itemsJson = new Schema<>();
+            processGenericTypeSchemaInline(elementType, itemsJson, visited);
+            schema.setItems(itemsJson);
+        } else if (rawType == Map.class || rawType == TreeMap.class || rawType == HashMap.class || rawType == LinkedHashMap.class) {
+            schema.setType("object");
+            Type[] typeArguments = paramType.getActualTypeArguments();
+            Type valueType = typeArguments.length > 1 ? typeArguments[1] : null;
+            Schema<?> additionalPropsJson = new Schema<>();
+            processGenericTypeSchemaInline(valueType, additionalPropsJson, visited);
+            schema.setAdditionalProperties(additionalPropsJson);
+        } else if (rawType instanceof Class<?>) {
+            processFieldsSchemaInline((Class<?>) rawType, schema, visited);
+        }
+    }
+
+    // ===========================================
+    // SHARED UTILITY METHODS
+    // ===========================================
+
+    private static boolean isPrimitiveOrJavaType(Class<?> clazz) {
+        return clazz.isPrimitive() ||
+                clazz.getName().startsWith("java.lang.") ||
+                clazz.getName().startsWith("java.time.") ||
+                clazz.getName().startsWith("java.util.") ||
+                clazz.getName().startsWith("javax.");
+    }
+
+    private static void setPrimitiveTypeSchema(Class<?> clazz, Schema<?> schema) {
+        String parameterType = clazz.getSimpleName().toLowerCase();
+
+        if (parameterType.equals("int") || parameterType.equals("integer")) {
+            schema.setType("integer");
+        } else if (parameterType.equals("long")) {
+            schema.setType("integer");
+            schema.setFormat("int64");
+        } else if (parameterType.equals("bigdecimal")) {
+            schema.setType("number");
+            schema.setFormat("double");
+        } else if (parameterType.equals("short")) {
+            schema.setType("integer");
+            schema.setFormat("int32");
+        } else if (parameterType.equals("localdate")) {
+            schema.setType("string");
+            schema.setFormat("date");
+        } else if (parameterType.equals("localdatetime") || parameterType.equals("zoneddatetime") ||
+                parameterType.equals("instant") || parameterType.equalsIgnoreCase("datetimeformatter")) {
+            schema.setType("string");
+            schema.setFormat("date-time");
+        } else if (parameterType.equalsIgnoreCase("zoneid")) {
+            schema.setType("string");
+            schema.setFormat("timezone");
+        } else if (parameterType.equalsIgnoreCase("pattern")) {
+            schema.setType("string");
+            schema.setFormat("regex");
+        } else if (parameterType.equals("float")) {
+            schema.setType("number");
+            schema.setFormat("float");
+        } else if (parameterType.equals("double")) {
+            schema.setType("number");
+            schema.setFormat("double");
+        } else if (parameterType.equals("date")) {
+            schema.setType("string");
+            schema.setFormat("date-time");
+        } else if (parameterType.equals("byte")) {
+            schema.setType("string");
+            schema.setFormat("byte");
+        } else if (parameterType.equals("boolean")) {
+            schema.setType("boolean");
+        } else if (parameterType.equals("char") || parameterType.equals("character")) {
+            schema.setType("string");
+        } else if (parameterType.equalsIgnoreCase("httpheaders") || parameterType.equalsIgnoreCase("path") ||
+                parameterType.equalsIgnoreCase("hashmap") || parameterType.equalsIgnoreCase("map") ) {
+            schema.setType("object");
+        } else if (parameterType.equals("multipartfile") || parameterType.equals("file")) {
+            schema.setType("string");
+            schema.setFormat("binary");
+        } else if (parameterType.equalsIgnoreCase("void")) {
+            // No type for void
+        } else if (parameterType.equals("string")) {
+            schema.setType("string");
+        }
+        else if (parameterType.equals("list")) {
+            schema.setType("array");
+            schema.setItems(new Schema<>());
+        }else {
+            schema.setType(parameterType);
+        }
+    }
 
     private static String getMappingUrl(Class<?> controller, Method method) {
         String baseUrl = "";
@@ -742,7 +1022,7 @@ public class ApiScanner {
     }
 
 
-    private static ApiResponses extractResponseBodies(Method method) throws JsonProcessingException {
+    private static ApiResponses extractResponseBodies(Method method, Components components) throws JsonProcessingException {
         ApiResponses responses = new ApiResponses();
         ApiResponse response = new ApiResponse();
         response.setDescription("");
@@ -767,13 +1047,13 @@ public class ApiScanner {
                             schema = new Schema<>();
                             mediaType.setSchema(schema);
                         } else {
-                            schema = getSchemaObject(actualType);
+                            schema = getSchemaObject(actualType, components);
                             mediaType.setSchema(schema);
                         }
                     }
                 }
             } else {
-                schema =  getBodyFieldsSchema( method.getGenericReturnType());
+                schema = getBodyFieldsSchema(method.getGenericReturnType(), components);
                 mediaType.setSchema(schema);
             }
         }
@@ -782,6 +1062,7 @@ public class ApiScanner {
         responses.put("200",response);
         return responses;
     }
+
     private static void findTargetClasses(File dir, List<URL> urls) throws MalformedURLException {
         if (!dir.exists()) return;
 
@@ -882,5 +1163,29 @@ public class ApiScanner {
                 return pathBuffer.toString();
             }
         }
+    }
+
+    private static List<Field> getAllFields(Class<?> clazz) {
+        List<Field> fields = new ArrayList<>();
+        Class<?> currentClass = clazz;
+
+        while (currentClass != null && currentClass != Object.class) {
+            Field[] declaredFields = currentClass.getDeclaredFields();
+            for (Field field : declaredFields) {
+                boolean isDuplicate = false;
+                for (Field existingField : fields) {
+                    if (existingField.getName().equals(field.getName())) {
+                        isDuplicate = true;
+                        break;
+                    }
+                }
+                if (!isDuplicate) {
+                    fields.add(field);
+                }
+            }
+            currentClass = currentClass.getSuperclass();
+        }
+
+        return fields;
     }
 }
